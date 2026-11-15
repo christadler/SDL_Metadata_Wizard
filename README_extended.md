@@ -27,13 +27,9 @@ For one experiment directory, the generator:
    `templates/file_format_map.json`, `templates/file_type_map.json` and
    `templates/file_type_path_map.json`.
 5. Assigns descriptions to simulations/datasets from the `folders`,
-   `extensions`, `folders_fallback` and `filename_keywords` sections of
-   the same YAML block; falls back to a generic description if a
-   file/folder isn't covered.
-6. Optionally attaches `spatialCoverage`/`temporalCoverage` to one or all
-   dataset entries, from an optional `coverage:` section — see "Coverage"
-   below.
-7. Renders `experiment.json.j2`, `simulation.json.j2` and `dataset.json.j2`
+   `extensions` and `folders_fallback` sections of the same YAML block;
+   falls back to a generic description if a file/folder isn't covered.
+6. Renders `experiment.json.j2`, `simulation.json.j2` and `dataset.json.j2`
    and writes the combined result to the output file.
 
 ## Requirements
@@ -52,7 +48,6 @@ sdl_metadata_generator.py   # entry point
 file_format_lookup.py
 file_type_lookup.py
 readme_description_lookup.py
-coverage_lookup.py
 templates/
   authors.json              # shared author database (author ID -> name/identifiers)
   file_format_map.json      # file extension -> file format
@@ -101,15 +96,6 @@ extensions:
 
 folders_fallback:
   Mesh: "Mesh-related output"
-
-filename_keywords:
-  surface: "{folder}: surface output"
-  cell: "{folder}: volume (stress field) output"
-
-coverage:
-  temporal: {start: 2011-03-11, end: 2011-03-11}
-  spatial:
-    centroid: {lat: 38.3, lon: 142.4}
 ```
 
 - `name`, `description`, `author`, `version` are **required** — the
@@ -117,9 +103,8 @@ coverage:
   empty (an empty string/list counts as missing, not just an absent key).
 - Any other top-level key (e.g. `keywords`, `path`) is optional and is
   passed through into the metadata file as-is.
-- `folders`, `extensions`, `folders_fallback`, `filename_keywords` and
-  `coverage` are all optional; see "Descriptions" and "Coverage" below
-  for how they work.
+- `folders`, `extensions`, `folders_fallback` are all optional; see
+  "Descriptions" below for how they're matched.
 
 ## Authors
 
@@ -159,16 +144,14 @@ to catch typos in author IDs.
 
 ## Descriptions
 
-`folders`, `extensions`, `folders_fallback` and `filename_keywords`
-control the `description` field of generated simulation/dataset entries.
-Lookup order for a file:
+`folders`, `extensions` and `folders_fallback` control the `description`
+field of generated simulation/dataset entries. Lookup order for a file:
 
 1. `extensions[".ext"]` **if** written as `{description: ..., priority: true}`
-2. `filename_keywords[<keyword>]` (see below)
-3. `folders[<exact parent folder name>]`
-4. `extensions[".ext"]` (non-priority form, i.e. a plain string)
-5. `folders_fallback[<exact parent folder name>]`
-6. generic fallback: `"Description of <file_name>"`
+2. `folders[<exact parent folder name>]`
+3. `extensions[".ext"]` (non-priority form, i.e. a plain string)
+4. `folders_fallback[<exact parent folder name>]`
+5. generic fallback: `"Description of <file_name>"`
 
 For simulations (top-level folders), only `folders` is checked; unmatched
 folders fall back to `"Description of <folder_name>"`.
@@ -177,102 +160,64 @@ The placeholder `{folder}` in any description is replaced with the
 **top-level** run/model folder name the file is located under (not the
 file's direct parent folder if it's nested deeper).
 
-### filename_keywords
+## File format / file type lookup
 
-For file names where the extension and folder alone can't tell datasets
-apart — e.g. SeisSol output files that only differ in a keyword placed
-right before the extension. SeisSol's current output naming is
-`Prefix-SlurmID-outputfilename` (the `outputfilename` part itself has no
-`-`), where `outputfilename` is `{volume|surface|fault}_{cell|vertex}.h5`
-or `{volume|surface|fault}.xdmf`:
+`file_format` and `file_type` are not hard-coded in the script: they are
+looked up per file in three shared JSON mapping tables in `templates/`
+(`--templates_dir`). The "extension" is the part of the file name after
+the last dot, lowercased (`u1.bin` → `bin`).
 
-```yaml
-filename_keywords:
-  volume_cell: "{folder}: stress field volume output (cell-centered)"
-  volume_vertex: "{folder}: stress field volume output (vertex-centered)"
-  surface_cell: "{folder}: surface output (cell-centered)"
-  surface_vertex: "{folder}: surface output (vertex-centered)"
-  fault_cell: "{folder}: fault output (cell-centered)"
-  fault_vertex: "{folder}: fault output (vertex-centered)"
-  volume: "{folder}: stress field volume output"
-  surface: "{folder}: surface output"
-  fault: "{folder}: fault output"
-  receiver: "{folder}: receiver output"
-  miniSeissol: "{folder}: technical output"
+| Table                     | Maps                     | Example              |
+|---------------------------|--------------------------|----------------------|
+| `file_format_map.json`    | extension → file format  | `"h5": "HDF5"`       |
+| `file_type_map.json`      | extension → file type    | `"bin": "output"`    |
+| `file_type_path_map.json` | path keyword → file type | `"output": "output"` |
+
+**`file_format`** comes from `file_format_map.json` only.
+
+**`file_type`** is resolved in this order:
+
+1. `file_type_map.json`, **if** the extension is written in the long form
+   with `override_path` — it then wins over any path keyword:
+   ```json
+   {
+       "csv": {"type": "product", "override_path": true}
+   }
+   ```
+2. `file_type_path_map.json`: the first keyword that occurs anywhere in
+   the file's **folder** path (case-insensitive substring match, file name
+   itself excluded). Note that this is the full folder path including the
+   `--path` prefix, so a keyword like `input` in a parent directory name
+   matches every file. If several keywords match, the first one in the
+   JSON wins — avoid overlapping keywords.
+3. `file_type_map.json`, short form (`"par": "input"`).
+
+### The tables learn new extensions
+
+If an extension is missing from `file_format_map.json` or
+`file_type_map.json`, the script stops and asks:
+
+```
+Add '.ext' to the file_format dictionary? [y/n]:
+Which file_format should be set for '.ext'? (e.g. PAR):
 ```
 
-- A keyword is **one word** (e.g. `surface`) or **several words joined
-  with `_`/`-`** (e.g. `volume_cell`). The file name (without its
-  extension) is split into tokens the same way, on `_`/`-`.
-  - A one-word keyword matches if that token appears **anywhere** in the
-    file name (case-insensitive).
-  - A multi-word keyword matches only where its words appear as a
-    **contiguous, ordered run** — e.g. `volume_cell` matches
-    `..._volume_cell.h5` but not `..._volume_vertex.h5`, even though
-    both contain `volume`. This is what lets `volume_cell` and
-    `volume_vertex` get different descriptions, instead of both just
-    matching a shared `volume` keyword.
-  - Either way, it's always a match against whole tokens, never a plain
-    substring match — `"fault"` does **not** match inside
-    `default_params.csv` (the token there is `default`, not `fault`).
-- Keywords are checked **in the order they're listed** — the first match
-  wins. List more specific keywords (longer/multi-word, like
-  `volume_cell`) before shorter ones they overlap with (like `volume`,
-  which also matches a plain `..._volume.xdmf` with no cell/vertex
-  suffix) — list order is priority order.
-- `filename_keywords` is checked **before** `folders`/`extensions`
-  (non-priority), but **after** any `extensions` entry marked
-  `priority: true` — a priority extension always wins. If you want
-  `filename_keywords` to decide for a given extension (e.g. `.h5`,
-  `.xdmf`), make sure that extension is **not** also marked
-  `priority: true`.
+Answering `y` saves the new entry to the JSON **immediately**, so it
+applies to the rest of the run and to all future runs (and, since the
+tables are shared, to every experiment). Answering anything else uses a
+one-off fallback without saving: the uppercased extension for
+`file_format`, `output` for `file_type`. To avoid the prompts — e.g. for
+unattended or timed runs — add new extensions to the JSON files
+beforehand. `file_type_path_map.json` never prompts; edit it manually.
 
-## Coverage
+### Seed values if a table is missing
 
-An optional `coverage:` section in the README's yaml block sets
-`spatialCoverage`/`temporalCoverage` on dataset entries in the generated
-metadata. SDL only supports coverage per-dataset, not per experiment or
-version — but even a single dataset with coverage is enough for SDL to
-show it for the whole experiment.
-
-```yaml
-coverage:
-  temporal: {start: 2011-03-11, end: 2011-03-11}
-  spatial:
-    centroid: {lat: 38.3, lon: 142.4}
-    polygon: "POLYGON((141.0 35.5, 145.0 35.5, 145.0 40.5, 141.0 40.5, 141.0 35.5))"  # optional
-  target: all   # optional, default shown - or a specific dataset filename, e.g. README.md
-```
-
-- **`coverage` itself is entirely optional** — if the section is absent,
-  nothing changes; no dataset gets coverage.
-- `temporal` and `spatial` are each optional on their own (only one of
-  them, both, or neither).
-- `temporal.start`/`temporal.end` must be valid ISO dates (`YYYY-MM-DD`),
-  and `start` must not be after `end`.
-- `spatial.centroid.lat` must be in `[-90, 90]`, `spatial.centroid.lon` in
-  `[-180, 180]`.
-- `spatial.polygon` is optional, given as WKT
-  (`POLYGON((lon lat, lon lat, ...))`); the ring is closed automatically
-  if the first and last point don't already match. Needs at least 3
-  points.
-- `target` controls which dataset(s) get the coverage:
-  - **`all`** (the default, used if `target` is omitted): every generated
-    dataset entry gets the same coverage.
-  - **a specific filename** (e.g. `README.md`, `data.par`): only the
-    dataset with that exact filename gets the coverage. If no generated
-    dataset has that name, the script logs a warning and continues
-    **without** attaching coverage anywhere (it does not fail the run).
-- **Invalid values raise a hard error and stop the run** — bad date
-  format, `start` after `end`, lat/lon out of range, or a malformed WKT
-  polygon — same philosophy as the required top-level fields (`name`,
-  `description`, ...): a typo here should be obvious immediately, not
-  silently produce wrong/missing coverage.
-- The output format is SDL's **dataset API format**
-  (`centroid.coordinates` as `[lon, lat]`), not the export/download
-  format — SDL rejects the export format if submitted
-  (`must NOT have additional properties`). This conversion happens
-  automatically; you only ever write `lat`/`lon` in the README.
+If one of the three JSON files does not exist, it is recreated from small
+seed dictionaries in the code (`DEFAULT_FORMAT_MAP`,
+`DEFAULT_TYPE_MAP`, `DEFAULT_PATH_TYPE_MAP`). These seeds are only a
+starting point and **differ from the current tables** (e.g. `par` → `PAR`
+instead of `YAML`, `csv` → `data_product` instead of `product`), so keep
+the JSON files in `templates/` rather than relying on them.
 
 ## Running the script
 
@@ -318,8 +263,7 @@ The script uses Python's `logging` module instead of plain `print()`.
   on the console — the normal status output.
 - **With `--debug`**:
   - `DEBUG`-level messages are shown too (per-file/per-simulation detail,
-    which rule decided a `file_type`, whether coverage was attached to a
-    dataset, etc.).
+    which rule decided a `file_type`, etc.).
   - The same log output is additionally written to
     `logs/<exp_id>_run.log` (overwritten on every run — no history is
     kept across runs).
@@ -373,39 +317,15 @@ writes the result to `metadata/sdl_exp_309_metadata.json`, and (because of
 - **`experiment.json.j2` is only written with `--debug`**, to `logs/`
   (see "Logging and --debug" above) — without `--debug` it is not
   generated at all.
-- **Coverage target mismatch:** if `coverage.target` is set to a specific
-  filename that doesn't match any generated dataset (this doesn't apply
-  to the default `target: all`), the script logs a warning and continues
-  without attaching coverage anywhere — it does not fail the run. Check
-  the console output (or the log file with `--debug`) if you expect
-  coverage but don't see it in the result.
-- **Invalid coverage values are a hard error** (bad date, `start` after
-  `end`, lat/lon out of range, malformed polygon) — see "Coverage" above.
 - **File classification is extension/path-based**, driven entirely by the
   shared JSON maps in `templates/`. Add new extensions/paths there rather
   than editing `sdl_metadata_generator.py`.
-- **`file_type` normally checks the folder path before the extension**:
-  if a keyword from `templates/file_type_path_map.json` (e.g. `output`,
-  `input`) appears anywhere in the file's folder path, that `file_type`
-  is used directly - the extension (`templates/file_type_map.json`) is
-  only a fallback for files whose path matches no such keyword. An
-  extension entry can override this by being written in the long form
-  `{"type": ..., "override_path": true}` instead of a plain string - that
-  extension's `file_type` then **always** wins, even in a folder whose
-  path would otherwise match a path keyword. The shipped
-  `file_type_map.json` already uses this for `.csv`
-  (`{"type": "product", "override_path": true}`), so a `.csv` file is
-  always classified as `product`, even inside a folder named `output`.
-- **Unknown file extensions trigger two separate interactive prompts**,
-  one after the other: first
-  `Add '.ext' to the file_format dictionary? [y/n]` (asking for the
-  `file_format`, e.g. `PAR`), then, independently,
-  `Add '.ext' to the file_type dictionary? [y/n]` (asking for the
-  `file_type`, e.g. `input`/`output`/`product`). Answering either one
-  saves it permanently to the corresponding map in `templates/`. This is
-  independent of `--debug` and can make the script hang waiting for
-  input (twice) if run unattended against data containing unfamiliar
-  extensions.
+- **Unknown file extensions still trigger an interactive prompt**
+  (`Add '.ext' to the file_format/file_type dictionary? [y/n]`), asking
+  whether to permanently add the extension to the relevant map in
+  `templates/`. This is independent of `--debug` and can make the script
+  hang waiting for input if run unattended against data containing
+  unfamiliar extensions (see "File format / file type lookup" above).
 - **The recursive file scan (`--path`) does not exclude hidden folders**
   such as `.git`. Pointing `--path` at (or into) a git repository will
   walk its `.git/` contents too, likely triggering many of the "unknown
