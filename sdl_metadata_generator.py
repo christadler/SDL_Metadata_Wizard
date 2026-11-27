@@ -3,7 +3,6 @@ import json
 import logging
 #import numpy as np
 from pathlib import Path
-from jinja2 import Environment, FileSystemLoader
 from file_format_lookup import get_file_format, load_format_map, DEFAULT_MAP_FILE as DEFAULT_FORMAT_MAP_FILE
 from file_type_lookup import (
     get_file_type,
@@ -56,31 +55,22 @@ def resolve_authors(author_ids, authors_db: dict) -> list:
     return resolved
 
 
-# generate authors JSON string for template
-def generate_authors_str(authors: list) -> str:
-    authors_list = []
-    for author in authors:
-        # build identifiers list
-        identifiers = []
-        for identifier in author.get('identifiers', []):
-            identifiers.append(
-                f'{{"scheme": "{identifier["scheme"]}", "value": "{identifier["value"]}"}}'
-            )
-        identifiers_str = ", ".join(identifiers)
-
-        authors_list.append(
-            f'{{"givenName": "{author["givenName"]}", '
-            f'"familyName": "{author["familyName"]}", '
-            f'"identifiers": [{identifiers_str}]}}'
-        )
-
-    return ", ".join(authors_list)
+# build one author entry; only the fields SDL expects are taken from authors.json
+def build_author(author: dict) -> dict:
+    return {
+        "givenName": author["givenName"],
+        "familyName": author["familyName"],
+        "identifiers": [
+            {"scheme": identifier["scheme"], "value": identifier["value"]}
+            for identifier in author.get("identifiers", [])
+        ],
+    }
 
 # build one simulation entry (a top-level folder) as a plain dict
 def build_simulation(name: str, path: str, dataset_paths: list, description) -> dict:
     return {
         "datasetPaths": dataset_paths,
-        # str() keeps today's output if a README value is not text (Jinja did the same)
+        # str() keeps the output of the old Jinja templates for non-text README values
         "description": str(description),
         "name": name,
         "path": f"{path}/",
@@ -100,48 +90,54 @@ def build_dataset(name: str, path: str, file_format: str, file_type: str, descri
         dataset.update(coverage)
     return dataset
 
-# generate experiment.json.j2 from the README's meta fields
-def generate_exp_template(env: Environment, meta: dict, authors_str: str, exp_id: str, debug: bool):
+# README keys with dedicated handling (author -> "authors", version -> inside
+# "versions"); every OTHER key of the yaml block is passed through as an
+# additional top-level field (e.g. "keywords")
+RESERVED_META_KEYS = {"name", "description", "author", "version"}
+# top-level fields the generator builds itself - a README key with one of
+# these names would clash with them
+GENERATED_KEYS = {"authors", "versions"}
 
-    # Fields with dedicated handling elsewhere (author -> resolved authors_str,
-    # version -> placed inside "versions[0]"). Any OTHER key present in the
-    # README's yaml block is passed through automatically as an additional
-    # top-level property (e.g. "keywords", "path", ...).
-    reserved_keys = {"name", "description", "author", "version"}
-    extra_lines = []
-    for key, value in meta.items():
-        if key in reserved_keys:
-            continue
-        # json.dumps handles quoting/escaping correctly for strings, lists,
-        # numbers, dicts, etc. - safer than manual string concatenation.
-        extra_lines.append(f'    {json.dumps(key)}: {json.dumps(value)},')
-    extra_fields_str = ("\n".join(extra_lines) + "\n") if extra_lines else ""
 
-    template = """\
-{
-    "name":        """ + json.dumps(meta['name']) + """,
-    "description": """ + json.dumps(meta['description']) + """,
-""" + extra_fields_str + """    "authors":     [ """ + authors_str + """ ],
-    "versions":    [
-        {
-            "version":     """ + json.dumps(meta['version']) + """,
-            "simulations": [ {{ all_simulations }} ],
-            "datasets":    [ {{ all_datasets }} ]
-        }
-    ]
-}
-"""
-    # save experiment.json.j2 as an intermediate artifact for debugging,
-    # only when explicitly requested via --debug
-    if debug:
-        template_path = Path("logs") / f"{exp_id}_experiment.json.j2"
-        template_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(template_path, 'w') as f:
-            f.write(template)
-        logger.debug(f"Wrote intermediate template to: {template_path}")
+# build the complete experiment metadata as one plain dict
+def build_experiment(meta: dict, authors: list, simulations: list, datasets: list) -> dict:
+    extra_fields = {key: value for key, value in meta.items() if key not in RESERVED_META_KEYS}
 
-    templ = env.from_string(template)
-    return templ
+    clashes = GENERATED_KEYS & extra_fields.keys()
+    if clashes:
+        raise ValueError(
+            f"README yaml block must not contain the key(s) {', '.join(sorted(clashes))} - "
+            f"these fields are generated"
+        )
+
+    return {
+        "name": meta["name"],
+        "description": meta["description"],
+        **extra_fields,
+        "authors": [build_author(author) for author in authors],
+        "versions": [
+            {
+                "version": meta["version"],
+                "simulations": simulations,
+                "datasets": datasets,
+            }
+        ],
+    }
+
+
+# write the metadata as JSON - first to a temporary file, so that an error
+# never leaves an empty or half-written output file behind
+def write_output(experiment: dict, output_file: Path) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = output_file.with_name(output_file.name + ".tmp")
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(experiment, f, indent=4, ensure_ascii=False)
+            f.write("\n")
+    except Exception:
+        tmp_file.unlink(missing_ok=True)
+        raise
+    tmp_file.replace(output_file)
 
 
 def parse_args():
@@ -252,8 +248,6 @@ def main():
     authors = resolve_authors(meta['author'], authors_db)
     logger.debug(f'authors : {authors}')
 
-    # generate authors string for template
-    authors_str = generate_authors_str(authors)
 
     # The README is always included as a dataset entry - every experiment
     # is expected to have one, and it's part of the data as far as SDL is
@@ -278,12 +272,6 @@ def main():
     # dictionary above.
     type_path_map_file = str(Path(args.templates_dir) / DEFAULT_TYPE_PATH_MAP_FILE)
     type_path_map = load_path_type_map(type_path_map_file)
-
-    # set Jinja2 Environment
-    env = Environment(loader=FileSystemLoader(args.templates_dir))
-
-    # generate experiment.json.j2 from the README's meta fields
-    templ_exp = generate_exp_template(env, meta, authors_str, exp_id, args.debug)
 
     # collect simulation and dataset entries as plain dicts
     simulations = []
@@ -408,14 +396,9 @@ def main():
         logger.warning(f"coverage.target '{coverage_target}' was not found among the generated "f"datasets - no coverage was attached to any dataset")
 
 
-    # write metadata.json
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, "w") as f:
-        f.write(templ_exp.render(
-            **meta,
-            all_simulations=", ".join(json.dumps(s) for s in simulations),
-            all_datasets=", ".join(json.dumps(d) for d in datasets))
-        )
+    # build the complete metadata and write it as JSON
+    experiment = build_experiment(meta, authors, simulations, datasets)
+    write_output(experiment, output_file)
     logger.info(f"finished, metadata written to: {output_file}")
 
 
