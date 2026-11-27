@@ -35,8 +35,8 @@ def load_authors(templates_dir: str) -> dict:
         logger.warning(f"Authors file does not exist: {authors_file}")
         return {}
 
-    with open(authors_file, 'r') as _:   # encoding='utf-8'
-        return json.load(_)
+    with open(authors_file, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # resolve author IDs to full author info
@@ -178,7 +178,7 @@ def main():
     if args.debug:
         log_file = Path("logs") / f"{exp_id}_run.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, mode="w"))
+        handlers.append(logging.FileHandler(log_file, mode="w", encoding="utf-8"))
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(levelname)s: %(message)s", handlers=handlers)
 
