@@ -76,11 +76,29 @@ def generate_authors_str(authors: list) -> str:
 
     return ", ".join(authors_list)
 
-# convert the API-format coverage dict into a ready-to-insert extra-fields string for dataset.json.j2's "coverage_extra" slot
-def generate_coverage_extra(api_coverage: dict) -> str:
-    coverage_lines = [f'{json.dumps(key)}: {json.dumps(value)}' for key, value in api_coverage.items()]
+# build one simulation entry (a top-level folder) as a plain dict
+def build_simulation(name: str, path: str, dataset_paths: list, description) -> dict:
+    return {
+        "datasetPaths": dataset_paths,
+        # str() keeps today's output if a README value is not text (Jinja did the same)
+        "description": str(description),
+        "name": name,
+        "path": f"{path}/",
+    }
 
-    return ",\n ".join(coverage_lines)
+
+# build one dataset entry (a file) as a plain dict; coverage keys are merged in if given
+def build_dataset(name: str, path: str, file_format: str, file_type: str, description, coverage: dict | None = None) -> dict:
+    dataset = {
+        "description": str(description),
+        "fileFormat": file_format,
+        "name": name,
+        "path": path,
+        "type": file_type,
+    }
+    if coverage:
+        dataset.update(coverage)
+    return dataset
 
 # generate experiment.json.j2 from the README's meta fields
 def generate_exp_template(env: Environment, meta: dict, authors_str: str, exp_id: str, debug: bool):
@@ -264,16 +282,12 @@ def main():
     # set Jinja2 Environment
     env = Environment(loader=FileSystemLoader(args.templates_dir))
 
-    # load templates
-    templ_s_r = env.get_template('simulation.json.j2')
-    templ_d_s = env.get_template('dataset.json.j2')
-
     # generate experiment.json.j2 from the README's meta fields
     templ_exp = generate_exp_template(env, meta, authors_str, exp_id, args.debug)
 
-    # write general information to metadata.json
-    all_s_r = ""
-    all_d_s = ""
+    # collect simulation and dataset entries as plain dicts
+    simulations = []
+    datasets = []
 
     all_items = sorted(input_path.rglob('*'))
 
@@ -319,8 +333,7 @@ def main():
                 continue
 
             logger.debug(f"Generate simulation for: {item.name}")
-            if all_s_r:
-                all_s_r += ","
+
 
             # Description sourced from the README's embedded yaml block
             # (see readme_description_lookup.py).
@@ -328,13 +341,8 @@ def main():
 
             simulation_path = item.relative_to(input_path).as_posix()
             dataset_paths = dataset_paths_by_top_level.get(item.name, [])
-            dataset_paths_json = json.dumps(dataset_paths)
-            all_s_r += templ_s_r.render(
-                simulation_name=item.name,
-                simulation_path=simulation_path,
-                dataset_paths_json=dataset_paths_json,
-                description=description
-            )
+            simulations.append(build_simulation(item.name, simulation_path, dataset_paths, description))
+
 
         # for all files add a dataset
         elif item.is_file():
@@ -372,29 +380,21 @@ def main():
 
             #  TODO: More elaborate descriptions and input|output|data product|etc
 
-            coverage_extra = ""
+            dataset_coverage = None
             if per_dataset_coverage is not None:
                 entry_coverage = per_dataset_coverage.get(dataset_path)
                 if entry_coverage:
-                    coverage_extra = generate_coverage_extra(entry_coverage)
+                    dataset_coverage = entry_coverage
                     coverage_applied = True
                     applied_dataset_paths.add(dataset_path)
                     logger.debug(f"Attaching per-dataset coverage to dataset: {dataset_path}")
             elif coverage is not None and (coverage_target == "all" or file_name == coverage_target):
-                coverage_extra = generate_coverage_extra(api_coverage)
+                dataset_coverage = api_coverage
                 coverage_applied = True
                 logger.debug(f"Attaching coverage to dataset: {file_name}")
 
-            if all_d_s != "": all_d_s += ","
-            all_d_s += templ_d_s.render(
-                prefix=prefix,
-                dataset_path=dataset_path,
-                file_name=file_name,
-                file_format=file_format,
-                description=description,
-                file_type=file_type,
-                coverage_extra=coverage_extra
-            )
+            datasets.append(
+                build_dataset(file_name, dataset_path, file_format, file_type, description, dataset_coverage))
 
     if per_dataset_coverage is not None:
         missing = sorted(set(per_dataset_coverage) - applied_dataset_paths)
@@ -413,8 +413,8 @@ def main():
     with open(output_file, "w") as f:
         f.write(templ_exp.render(
             **meta,
-            all_simulations=all_s_r,
-            all_datasets=all_d_s)
+            all_simulations=", ".join(json.dumps(s) for s in simulations),
+            all_datasets=", ".join(json.dumps(d) for d in datasets))
         )
     logger.info(f"finished, metadata written to: {output_file}")
 
